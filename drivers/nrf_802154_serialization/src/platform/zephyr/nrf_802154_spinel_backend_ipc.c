@@ -16,6 +16,8 @@
 #include "nrf_802154_serialization_error.h"
 #include "../../spinel_base/spinel.h"
 
+#include <openamp/multi_instance.h>
+
 #define LOG_LEVEL LOG_LEVEL_INFO
 #define LOG_MODULE_NAME spinel_ipc_backend
 LOG_MODULE_REGISTER(LOG_MODULE_NAME);
@@ -38,23 +40,29 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 static K_SEM_DEFINE(ready_sem, 0, 1);
 /* Configuration defines */
 
-#define SHM_NODE            DT_CHOSEN(zephyr_ipc_shm)
+#define INST_NO			1
 
-#define VDEV_START_ADDR		DT_REG_ADDR(SHM_NODE)
-#define VDEV_SIZE		    DT_REG_SIZE(SHM_NODE)
+#define SHM_NODE		DT_CHOSEN(zephyr_ipc_shm)
+#define SHM_START_ADDR		DT_REG_ADDR(SHM_NODE)
+#define SHM_SIZE		DT_REG_SIZE(SHM_NODE)
 
-#define VDEV_STATUS_ADDR	VDEV_START_ADDR
-#define VDEV_STATUS_SIZE	0x400
-
-#define SHM_START_ADDR		(VDEV_START_ADDR + VDEV_STATUS_SIZE)
-#define SHM_SIZE		    (VDEV_SIZE - VDEV_STATUS_SIZE)
+#define SHM_INST_ADDR                                                          \
+	SHMEM_INST_ADDR_AUTOALLOC_GET(SHM_START_ADDR, SHM_SIZE, INST_NO)
+#define SHM_INST_SIZE		SHMEM_INST_SIZE_AUTOALLOC_GET(SHM_SIZE)
 #define SHM_DEVICE_NAME		"sramx.shm"
 
-#define VRING_COUNT		    2
-#define VRING_RX_ADDRESS	(VDEV_START_ADDR + SHM_SIZE - VDEV_STATUS_SIZE)
-#define VRING_TX_ADDRESS	(VDEV_START_ADDR + SHM_SIZE)
-#define VRING_ALIGNMENT		4
-#define VRING_SIZE		    16
+#define VRING_COUNT		2
+#define VRING_SIZE		VRING_SIZE_GET(SHM_SIZE)
+#define RPMSG_REG_SIZE		(VRING_COUNT * VIRTQUEUE_SIZE_GET(VRING_SIZE))
+#define VRING_REGION_SIZE	VRING_SIZE_COMPUTE(VRING_SIZE, VRING_ALIGNMENT)
+
+#define SHM_LOCAL_START_ADDR	(SHM_INST_ADDR + VDEV_STATUS_SIZE)
+#define SHM_LOCAL_SIZE		(SHM_INST_SIZE - VDEV_STATUS_SIZE)
+
+#define VRING_RX_ADDRESS	(SHM_LOCAL_START_ADDR + RPMSG_REG_SIZE)
+#define VRING_TX_ADDRESS	(VRING_RX_ADDRESS + VRING_REGION_SIZE)
+
+#define STATUS_ADDR		SHM_INST_ADDR
 
 #define IPM_WORK_QUEUE_STACK_SIZE 2048
 
@@ -73,16 +81,16 @@ struct k_work_q ipm_work_q;
 static const struct device *ipm_tx_handle;
 static const struct device *ipm_rx_handle;
 
-static metal_phys_addr_t shm_physmap[] = { SHM_START_ADDR };
+static metal_phys_addr_t shm_physmap[] = { SHM_LOCAL_START_ADDR };
 static struct metal_device shm_device = {
 	.name = SHM_DEVICE_NAME,
 	.bus = NULL,
 	.num_regions = 1,
 	{
 		{
-			.virt       = (void *) SHM_START_ADDR,
+			.virt       = (void *) SHM_LOCAL_START_ADDR,
 			.physmap    = shm_physmap,
-			.size       = SHM_SIZE,
+			.size       = SHM_LOCAL_SIZE,
 			.page_shift = 0xffffffff,
 			.page_mask  = 0xffffffff,
 			.mem_flags  = 0,
@@ -119,13 +127,13 @@ static unsigned char virtio_get_status(struct virtio_device *vdev)
 #if IPC_MASTER
 	return VIRTIO_CONFIG_STATUS_DRIVER_OK;
 #else
-	return sys_read8(VDEV_STATUS_ADDR);
+	return sys_read8(STATUS_ADDR);
 #endif
 }
 
 static void virtio_set_status(struct virtio_device *vdev, unsigned char status)
 {
-	sys_write8(status, VDEV_STATUS_ADDR);
+	sys_write8(status, STATUS_ADDR);
 }
 
 static uint32_t virtio_get_features(struct virtio_device *vdev)
@@ -150,7 +158,7 @@ static void virtio_notify(struct virtqueue *vq)
 	}
 }
 
-const struct virtio_dispatch dispatch = {
+static const struct virtio_dispatch dispatch = {
 	.get_status = virtio_get_status,
 	.set_status = virtio_set_status,
 	.get_features = virtio_get_features,
@@ -262,11 +270,11 @@ nrf_802154_ser_err_t nrf_802154_backend_init(void)
 
 	/* IPM setup */
 #if IPC_MASTER
-	ipm_tx_handle = device_get_binding("IPM_0");
-	ipm_rx_handle = device_get_binding("IPM_1");
+	ipm_tx_handle = device_get_binding("IPM_2");
+	ipm_rx_handle = device_get_binding("IPM_3");
 #else
-	ipm_rx_handle = device_get_binding("IPM_0");
-	ipm_tx_handle = device_get_binding("IPM_1");
+	ipm_rx_handle = device_get_binding("IPM_2");
+	ipm_tx_handle = device_get_binding("IPM_3");
 #endif
 
 	if (!ipm_tx_handle) {
@@ -311,8 +319,15 @@ nrf_802154_ser_err_t nrf_802154_backend_init(void)
 	vdev.func = &dispatch;
 	vdev.vrings_info = &rvrings[0];
 
+	LOG_WRN("MP MA 0x%08x, s: 0x%08x", SHM_START_ADDR, SHM_SIZE);
+	LOG_WRN("MP shmem 0x%08x, 0x%08x", SHM_INST_ADDR, SHM_INST_SIZE);
+	LOG_WRN("MP Vring, s: %d", VRING_SIZE);
+	LOG_WRN("MP Vring RX 0x%08x", VRING_RX_ADDRESS);
+	LOG_WRN("MP Vring TX 0x%08x", VRING_TX_ADDRESS);
+
 #if IPC_MASTER
-	rpmsg_virtio_init_shm_pool(&shpool, (void *)SHM_START_ADDR, SHM_SIZE);
+	rpmsg_virtio_init_shm_pool(&shpool, (void *)shm_device.regions->virt,
+				   shm_device.regions->size);
 	err = rpmsg_init_vdev(&rvdev, &vdev, ns_bind_cb, io, &shpool);
 #else
 	err = rpmsg_init_vdev(&rvdev, &vdev, NULL, io, NULL);
@@ -325,8 +340,11 @@ nrf_802154_ser_err_t nrf_802154_backend_init(void)
 
 #if IPC_MASTER
 	/* Wait til nameservice ep is setup */
-	k_sem_take(&ready_sem, K_FOREVER);
-
+	err = k_sem_take(&ready_sem, K_SECONDS(3));
+	if (err) {
+		LOG_ERR("No contact with network core EP (err %d)", err);
+		return err;
+	}
 	/* Send dummy data so we can start communication in both directions.
 	 * Simple NULL won't work as rpmsg_send won't send anything with NULL.
 	 */
@@ -434,17 +452,3 @@ nrf_802154_ser_err_t nrf_802154_spinel_encoded_packet_send(const void *p_data,
 												(nrf_802154_ser_err_t) ret);
 	}
 }
-
-#if IPC_MASTER
-/* Make sure we clear out the status flag very early (before we bringup the
- * secondary core) so the secondary core see's the proper status
- */
-int init_status_flag(const struct device *arg)
-{
-	virtio_set_status(NULL, 0);
-
-	return 0;
-}
-
-SYS_INIT(init_status_flag, PRE_KERNEL_1, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
-#endif
