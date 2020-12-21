@@ -40,7 +40,7 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 static K_SEM_DEFINE(ready_sem, 0, 1);
 /* Configuration defines */
 
-#define INST_NO			1
+#define INST_NO			(CONFIG_OPENAMP_INSTANCES_NUM - 1)
 
 #define SHM_NODE		DT_CHOSEN(zephyr_ipc_shm)
 #define SHM_START_ADDR		DT_REG_ADDR(SHM_NODE)
