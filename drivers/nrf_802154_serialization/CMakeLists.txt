@@ -41,6 +41,7 @@ zephyr_library_sources(
     src/platform/zephyr/nrf_802154_spinel_log.c
     src/platform/zephyr/nrf_802154_spinel_backend_ipc.c
     src/platform/zephyr/nrf_802154_spinel_response_notifier.c
+    src/platform/zephyr/nrf_802154_spinel_packet_send.c
 )
 
 if (CONFIG_NRF_802154_SER_HOST)
